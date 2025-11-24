@@ -7,7 +7,7 @@ const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZ
 const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
 (() => {
-  // ... (todos tus elementos DOM — sin cambios)
+  // === Elementos DOM ===
   const fileInput = document.getElementById('file-input');
   const fileInfo = document.getElementById('file-info');
   const columnsArea = document.getElementById('columns-area');
@@ -30,11 +30,9 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
   const prevPageBtn = document.getElementById('prev-page');
   const nextPageBtn = document.getElementById('next-page');
   const pagerInfo = document.getElementById('pager-info');
-
   const saveProgressBtn = document.getElementById('saveProgress');
   const exportExcelBtn = document.getElementById('exportExcel');
   const resetAllBtn = document.getElementById('resetAll');
-
   const modal = document.getElementById('modal');
   const closeModalBtn = document.getElementById('close-modal');
   const modalTitle = document.getElementById('modal-title');
@@ -47,19 +45,20 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
   const modalNextBtn = document.getElementById('modal-next');
   const modalCopyBtn = document.getElementById('modal-copy');
 
-  // Data
+  // === Datos ===
   let rows = [];
   let headers = [];
   const statusKey = '_WMSG_STATUS_';
   let currentIndex = -1;
   let CURRENT_UMES_ID = null;
   let currentFilename = null;
+  let selectedPhoneColumn = null; // << NUEVA: columna de teléfono seleccionada
 
-  // Pagination
+  // === Paginación ===
   let currentPage = 1;
   function perPage() { return Number(perPageSelect.value || 20); }
 
-  // --- Helpers ---
+  // === Helpers ===
   function setFileInfo(txt) { if (fileInfo) fileInfo.textContent = txt; }
   function show(el) { if (el) el.hidden = false; }
   function hide(el) { if (el) el.hidden = true; }
@@ -103,27 +102,31 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
     if (total > 0 && progressArea) show(progressArea); else if (progressArea) hide(progressArea);
   }
 
-  // --- Guardar estado individual en Supabase (automático) ---
+  // === Guardado automático (incluye columna de teléfono) ===
   async function autoSaveProgress() {
     if (!CURRENT_UMES_ID) return;
     try {
+      const phoneCol = phoneColSelect.value;
       await supabase
         .from("umes")
-        .update({ progreso: rows.map(r => ({ estado: r[statusKey] })) })
+        .update({ 
+          progreso: rows.map(r => ({ estado: r[statusKey] })),
+          columna_telefono: phoneCol
+        })
         .eq("id", CURRENT_UMES_ID);
     } catch (err) {
       console.warn("No se pudo guardar automáticamente:", err);
     }
   }
 
-  // --- Cargar último progreso NO finalizado ---
+  // === Cargar último progreso NO finalizado ===
   async function loadLatestActiveProgress() {
     setFileInfo("Buscando sesión activa en la nube...");
 
     const { data, error } = await supabase
       .from("umes")
       .select("*")
-      .eq("finalizado", false) // 🔑 Solo los no finalizados
+      .eq("finalizado", false)
       .order("created_at", { ascending: false })
       .limit(1);
 
@@ -138,6 +141,7 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
       rows = record.filas || [];
       currentFilename = record.nombre_archivo;
       CURRENT_UMES_ID = record.id;
+      selectedPhoneColumn = record.columna_telefono || null;
 
       if (record.progreso && Array.isArray(record.progreso)) {
         rows = rows.map((row, i) => ({
@@ -150,6 +154,15 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
       headers = rows.length ? Object.keys(rows[0]).filter(k => k !== statusKey) : [];
       renderColumns();
+
+      // Restaurar columna de teléfono
+      if (selectedPhoneColumn && headers.includes(selectedPhoneColumn)) {
+        phoneColSelect.value = selectedPhoneColumn;
+      } else if (headers.length) {
+        const guess = headers.find(h => /phone|telefono|tel|cel|movil|whatsapp|numero|número/i.test(h));
+        phoneColSelect.value = guess || headers[0];
+      }
+
       show(templateArea);
       show(previewArea);
       if (record.plantilla) templateField.value = record.plantilla;
@@ -164,8 +177,8 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
           "postgres_changes",
           { event: "UPDATE", schema: "public", table: "umes", filter: `id=eq.${CURRENT_UMES_ID}` },
           (payload) => {
+            if (payload.new.finalizado) return;
             const { filas, progreso, plantilla } = payload.new;
-            if (payload.new.finalizado) return; // Si se finalizó, ignorar
             rows = filas.map((r, i) => ({
               ...r,
               [statusKey]: progreso[i]?.estado || "Pendiente"
@@ -184,7 +197,7 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
     }
   }
 
-  // --- Render columns ---
+  // === Renderizar columnas ===
   function renderColumns() {
     if (!columnsList || !phoneColSelect) return;
     columnsList.innerHTML = '';
@@ -201,14 +214,19 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
       phoneColSelect.appendChild(opt);
     });
 
-    const guess = headers.find(h => /phone|telefono|tel|cel|movil|whatsapp/i.test(h));
-    if (guess) phoneColSelect.value = guess;
-    else if (headers.length) phoneColSelect.value = headers[0];
+    // No adivinar si ya tenemos una seleccionada
+    if (selectedPhoneColumn && headers.includes(selectedPhoneColumn)) {
+      phoneColSelect.value = selectedPhoneColumn;
+    } else {
+      const guess = headers.find(h => /phone|telefono|tel|cel|movil|whatsapp|numero|número/i.test(h));
+      if (guess) phoneColSelect.value = guess;
+      else if (headers.length) phoneColSelect.value = headers[0];
+    }
 
     show(columnsArea);
   }
 
-  // --- File input handler ---
+  // === Cargar archivo ===
   fileInput.addEventListener('change', (ev) => {
     const f = ev.target.files[0];
     if (!f) return;
@@ -242,6 +260,7 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
     });
     headers = rows.length ? Object.keys(rows[0]) : [];
     currentFilename = filename;
+    selectedPhoneColumn = null; // Reset al cargar nuevo archivo
     renderColumns();
     show(templateArea);
     show(previewArea);
@@ -250,7 +269,7 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
     renderPreviewList(currentPage);
   }
 
-  // --- Preview rendering (igual que antes) ---
+  // === Previsualización ===
   function getFilteredRows() {
     const q = (searchInput?.value || '').trim().toLowerCase();
     if (!q) return rows;
@@ -306,7 +325,7 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
       cb.addEventListener('change', () => {
         r[statusKey] = cb.checked ? 'Enviado' : 'Pendiente';
         updateProgressUI();
-        autoSaveProgress(); // ✅ Guardado automático al marcar
+        autoSaveProgress();
         const metaLines = left.querySelectorAll('.preview-meta');
         if (metaLines[2]) metaLines[2].innerHTML = `Estado: <strong>${r[statusKey]}</strong>`;
       });
@@ -320,7 +339,7 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
         r[statusKey] = 'No enviado';
         cb.checked = false;
         updateProgressUI();
-        autoSaveProgress(); // ✅ Guardado automático
+        autoSaveProgress();
         const metaLines = left.querySelectorAll('.preview-meta');
         if (metaLines[2]) metaLines[2].innerHTML = `Estado: <strong>${r[statusKey]}</strong>`;
       });
@@ -361,7 +380,7 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
     return div.innerHTML;
   }
 
-  // --- Resto de funciones (modal, open all, etc.) sin cambios ---
+  // === Eventos ===
   if (previewBtn) previewBtn.addEventListener('click', () => {
     if (!rows.length) { alert('Carga primero un archivo.'); return; }
     renderPreviewList(1);
@@ -371,7 +390,7 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
   if (prevPageBtn) prevPageBtn.addEventListener('click', () => renderPreviewList(currentPage - 1));
   if (nextPageBtn) nextPageBtn.addEventListener('click', () => renderPreviewList(currentPage + 1));
 
-  // Modal functions (same as before)
+  // === Modal ===
   if (startBtn) startBtn.addEventListener('click', () => {
     const idx = rows.findIndex(r => r[statusKey] === 'Pendiente');
     if (idx === -1) { alert('No hay contactos pendientes.'); return; }
@@ -450,6 +469,7 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
     }
   }
 
+  // === Abrir todos ===
   if (openAllBtn) openAllBtn.addEventListener('click', () => {
     if (!rows.length) { alert('Carga primero un archivo.'); return; }
     if (!confirm('¿Abrir todos los contactos con teléfono?')) return;
@@ -470,22 +490,19 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
     if (count === 0) alert('No se detectaron teléfonos.');
   });
 
-  // --- ✅ EXPORTAR Y MARCAR COMO FINALIZADO ---
+  // === Exportar y marcar como finalizado ===
   if (exportExcelBtn) exportExcelBtn.addEventListener('click', async () => {
     if (!rows.length) { alert('No hay datos.'); return; }
 
-    // Guardar estado final
     await autoSaveProgress();
 
-    // Marcar como finalizado en Supabase
     if (CURRENT_UMES_ID) {
       await supabase
         .from("umes")
-        .update({ finalizado: true }) // 🔑 ¡Aquí está la bandera!
+        .update({ finalizado: true })
         .eq("id", CURRENT_UMES_ID);
     }
 
-    // Exportar
     const exportData = rows.map(r => {
       const row = { ...r };
       delete row[statusKey];
@@ -500,11 +517,11 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
     XLSX.writeFile(wb, `completado-${currentFilename || "datos"}.xlsx`);
 
     alert("✅ Exportación completada y marcada como finalizada.");
-    // Reiniciar interfaz
     rows = [];
     headers = [];
     CURRENT_UMES_ID = null;
     currentFilename = null;
+    selectedPhoneColumn = null;
     fileInput.value = "";
     setFileInfo("Ningún archivo cargado");
     hide(columnsArea);
@@ -515,12 +532,14 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
     updateProgressUI();
   });
 
-  // --- Guardar progreso manual (crea nuevo registro) ---
+  // === Guardar progreso manual ===
   if (saveProgressBtn) saveProgressBtn.addEventListener('click', async () => {
     if (!rows.length || !templateField.value.trim()) {
       alert("Carga un archivo y escribe una plantilla primero.");
       return;
     }
+
+    const phoneCol = phoneColSelect.value;
 
     const { data, error } = await supabase
       .from("umes")
@@ -530,7 +549,8 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
           filas: rows,
           progreso: rows.map(r => ({ estado: r[statusKey] })),
           plantilla: templateField.value,
-          finalizado: false // 🔑 Siempre false al guardar
+          columna_telefono: phoneCol,
+          finalizado: false
         }
       ])
       .select("id")
@@ -541,8 +561,8 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
       alert("❌ Error al guardar: " + (error.message || "Ver consola"));
     } else {
       CURRENT_UMES_ID = data.id;
-      alert("✅ Guardado como sesión activa");
-      // Escuchar cambios
+      selectedPhoneColumn = phoneCol;
+      alert("✅ Guardado con columna: " + phoneCol);
       supabase
         .channel(`realtime-umes-${CURRENT_UMES_ID}`)
         .on("postgres_changes", { event: "UPDATE", schema: "public", table: "umes", filter: `id=eq.${CURRENT_UMES_ID}` }, (payload) => {
@@ -561,10 +581,10 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
     if (confirm("¿Reiniciar todo?")) location.reload();
   });
 
-  // --- ✅ INICIALIZAR: Cargar solo si hay sesión activa ---
+  // === Inicializar ===
   (async function init() {
     templateField.value = templateField.value || "Hola {{Nombre}}, soy José. ¿Te interesa {{Carrera}}?";
     updateProgressUI();
-    await loadLatestActiveProgress(); // 🔑 Solo carga si finalizado = false
+    await loadLatestActiveProgress();
   })();
 })();
