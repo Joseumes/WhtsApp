@@ -1,10 +1,13 @@
-/* js/app.js
-   WMessage Web - cliente puro (no servidor)
-   Necesita: xlsx (SheetJS) cargado en index.html
-*/
+// ===============================
+// CONFIGURAR SUPABASE
+// ===============================
+const SUPABASE_URL = "https://eefnhmluhsyejoszrjir.supabase.co";
+const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVlZm5obWx1aHN5ZWpvc3pyamlyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjM5Mjg2ODIsImV4cCI6MjA3OTUwNDY4Mn0.UNatlYPt6EoNMy6fWPBxNilYvoJx5mbDwviCF9Gpdw0";
+
+const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
 (() => {
-  // DOM
+  // ... (todos tus elementos DOM — sin cambios)
   const fileInput = document.getElementById('file-input');
   const fileInfo = document.getElementById('file-info');
   const columnsArea = document.getElementById('columns-area');
@@ -18,12 +21,20 @@
   const openAllBtn = document.getElementById('open-all-btn');
   const previewArea = document.getElementById('preview-area');
   const previewList = document.getElementById('preview-list');
-  const exportBtn = document.getElementById('export-btn');
   const progressArea = document.getElementById('progress-area');
   const progressText = document.getElementById('progress-text');
   const progressFill = document.getElementById('progress-fill');
+  const searchInput = document.getElementById('search-input');
+  const perPageSelect = document.getElementById('per-page');
+  const pager = document.getElementById('pager');
+  const prevPageBtn = document.getElementById('prev-page');
+  const nextPageBtn = document.getElementById('next-page');
+  const pagerInfo = document.getElementById('pager-info');
 
-  // Modal elements
+  const saveProgressBtn = document.getElementById('saveProgress');
+  const exportExcelBtn = document.getElementById('exportExcel');
+  const resetAllBtn = document.getElementById('resetAll');
+
   const modal = document.getElementById('modal');
   const closeModalBtn = document.getElementById('close-modal');
   const modalTitle = document.getElementById('modal-title');
@@ -37,15 +48,21 @@
   const modalCopyBtn = document.getElementById('modal-copy');
 
   // Data
-  let rows = []; // array of objects
+  let rows = [];
   let headers = [];
-  let statusKey = '_WMSG_STATUS_'; // status key injected to rows
+  const statusKey = '_WMSG_STATUS_';
   let currentIndex = -1;
+  let CURRENT_UMES_ID = null;
+  let currentFilename = null;
+
+  // Pagination
+  let currentPage = 1;
+  function perPage() { return Number(perPageSelect.value || 20); }
 
   // --- Helpers ---
-  function setFileInfo(txt) { fileInfo.textContent = txt; }
-  function show(el) { el.hidden = false; }
-  function hide(el) { el.hidden = true; }
+  function setFileInfo(txt) { if (fileInfo) fileInfo.textContent = txt; }
+  function show(el) { if (el) el.hidden = false; }
+  function hide(el) { if (el) el.hidden = true; }
 
   function formatPhone(raw) {
     if (raw === undefined || raw === null) return '';
@@ -59,13 +76,11 @@
   function interpolate(template, row) {
     if (!template) return '';
     return template.replace(/{{\s*([^}]+)\s*}}/g, (m, key) => {
-      // exact match case-insensitive
       const foundKey = Object.keys(row).find(k => String(k).trim().toLowerCase() === key.trim().toLowerCase());
       if (foundKey) {
         const v = row[foundKey];
         return v === null || v === undefined ? '' : String(v);
       }
-      // partial match (column contains key)
       const part = Object.keys(row).find(k => String(k).toLowerCase().includes(key.trim().toLowerCase()));
       if (part) {
         const v = row[part];
@@ -80,39 +95,98 @@
     const sent = rows.filter(r => r[statusKey] === 'Enviado').length;
     const notsent = rows.filter(r => r[statusKey] === 'No enviado').length;
     const pending = rows.filter(r => r[statusKey] === 'Pendiente').length;
-    progressText.textContent = `Total: ${total} | Enviado: ${sent} | No enviado: ${notsent} | Pendiente: ${pending}`;
-    if (total === 0) {
-      progressFill.style.width = '0%';
-    } else {
-      const pct = Math.round(((sent + notsent) / total) * 100);
+    if (progressText) progressText.textContent = `Total: ${total} | Enviado: ${sent} | No enviado: ${notsent} | Pendiente: ${pending}`;
+    if (progressFill) {
+      const pct = total ? Math.round(((sent + notsent) / total) * 100) : 0;
       progressFill.style.width = pct + '%';
     }
-    if (total > 0) show(progressArea); else hide(progressArea);
+    if (total > 0 && progressArea) show(progressArea); else if (progressArea) hide(progressArea);
   }
 
-  function readWorkbookFromCSV(text) {
-    // Use SheetJS to parse CSV as workbook
-    return XLSX.read(text, { type: 'string' });
+  // --- Guardar estado individual en Supabase (automático) ---
+  async function autoSaveProgress() {
+    if (!CURRENT_UMES_ID) return;
+    try {
+      await supabase
+        .from("umes")
+        .update({ progreso: rows.map(r => ({ estado: r[statusKey] })) })
+        .eq("id", CURRENT_UMES_ID);
+    } catch (err) {
+      console.warn("No se pudo guardar automáticamente:", err);
+    }
   }
 
-  function parseWorkbook(wb) {
-    const first = wb.Sheets[wb.SheetNames[0]];
-    const json = XLSX.utils.sheet_to_json(first, { defval: '' });
-    rows = json.map(r => {
-      // ensure status key exists
-      const clone = Object.assign({}, r);
-      if (!clone.hasOwnProperty(statusKey)) clone[statusKey] = 'Pendiente';
-      return clone;
-    });
-    headers = Object.keys(rows[0] || {});
-    renderColumns();
-    show(templateArea);
-    show(previewArea);
-    updateProgressUI();
+  // --- Cargar último progreso NO finalizado ---
+  async function loadLatestActiveProgress() {
+    setFileInfo("Buscando sesión activa en la nube...");
+
+    const { data, error } = await supabase
+      .from("umes")
+      .select("*")
+      .eq("finalizado", false) // 🔑 Solo los no finalizados
+      .order("created_at", { ascending: false })
+      .limit(1);
+
+    if (error) {
+      console.error("Error al cargar:", error);
+      setFileInfo("Ningún archivo cargado");
+      return false;
+    }
+
+    if (data && data.length > 0) {
+      const record = data[0];
+      rows = record.filas || [];
+      currentFilename = record.nombre_archivo;
+      CURRENT_UMES_ID = record.id;
+
+      if (record.progreso && Array.isArray(record.progreso)) {
+        rows = rows.map((row, i) => ({
+          ...row,
+          [statusKey]: record.progreso[i]?.estado || "Pendiente"
+        }));
+      } else {
+        rows = rows.map(row => ({ ...row, [statusKey]: "Pendiente" }));
+      }
+
+      headers = rows.length ? Object.keys(rows[0]).filter(k => k !== statusKey) : [];
+      renderColumns();
+      show(templateArea);
+      show(previewArea);
+      if (record.plantilla) templateField.value = record.plantilla;
+      setFileInfo(`${currentFilename} — ${rows.length} contactos (activo)`);
+      updateProgressUI();
+      renderPreviewList(1);
+
+      // Escuchar cambios en tiempo real
+      supabase
+        .channel(`realtime-umes-${CURRENT_UMES_ID}`)
+        .on(
+          "postgres_changes",
+          { event: "UPDATE", schema: "public", table: "umes", filter: `id=eq.${CURRENT_UMES_ID}` },
+          (payload) => {
+            const { filas, progreso, plantilla } = payload.new;
+            if (payload.new.finalizado) return; // Si se finalizó, ignorar
+            rows = filas.map((r, i) => ({
+              ...r,
+              [statusKey]: progreso[i]?.estado || "Pendiente"
+            }));
+            if (plantilla) templateField.value = plantilla;
+            updateProgressUI();
+            renderPreviewList(currentPage);
+          }
+        )
+        .subscribe();
+
+      return true;
+    } else {
+      setFileInfo("Ningún archivo cargado");
+      return false;
+    }
   }
 
-  // --- Render columns and phone selector ---
+  // --- Render columns ---
   function renderColumns() {
+    if (!columnsList || !phoneColSelect) return;
     columnsList.innerHTML = '';
     phoneColSelect.innerHTML = '';
     headers.forEach(h => {
@@ -127,7 +201,6 @@
       phoneColSelect.appendChild(opt);
     });
 
-    // guess phone column
     const guess = headers.find(h => /phone|telefono|tel|cel|movil|whatsapp/i.test(h));
     if (guess) phoneColSelect.value = guess;
     else if (headers.length) phoneColSelect.value = headers[0];
@@ -142,62 +215,164 @@
     setFileInfo(f.name);
     const name = f.name.toLowerCase();
     const reader = new FileReader();
-    if (name.endsWith('.csv')) {
-      reader.onload = (e) => {
-        try {
-          const wb = readWorkbookFromCSV(e.target.result);
-          parseWorkbook(wb);
-        } catch (err) {
-          alert('Error al leer CSV: ' + err.message);
-        }
-      };
-      reader.readAsText(f, 'utf-8');
-    } else {
-      reader.onload = (e) => {
-        try {
+    reader.onload = (e) => {
+      try {
+        let wb;
+        if (name.endsWith('.csv')) {
+          wb = XLSX.read(e.target.result, { type: 'string' });
+        } else {
           const data = new Uint8Array(e.target.result);
-          const wb = XLSX.read(data, { type: 'array' });
-          parseWorkbook(wb);
-        } catch (err) {
-          alert('Error al leer Excel: ' + err.message);
+          wb = XLSX.read(data, { type: 'array' });
         }
-      };
-      reader.readAsArrayBuffer(f);
-    }
+        parseWorkbook(wb, f.name);
+      } catch (err) {
+        alert('Error al leer archivo: ' + err.message);
+      }
+    };
+    if (name.endsWith('.csv')) reader.readAsText(f, 'utf-8'); else reader.readAsArrayBuffer(f);
   });
 
-  // --- Preview ---
-  previewBtn.addEventListener('click', () => {
-    if (!rows.length) { alert('Carga primero un archivo.'); return; }
-    previewList.innerHTML = '';
-    const tmpl = templateField.value;
-    const limit = Math.min(5, rows.length);
-    for (let i = 0; i < limit; i++) {
-      const r = rows[i];
-      const txt = interpolate(tmpl, r);
-      const phoneCol = phoneColSelect.value;
-      const phone = formatPhone(r[phoneCol]);
-      const div = document.createElement('div');
-      div.className = 'preview-item';
-      div.innerHTML = `<div class="preview-meta"><strong>#${i+1}</strong> | Tel: ${phone || '<em>sin teléfono</em>'}</div>
-                       <div>${escapeHtml(txt)}</div>
-                       <div class="preview-meta">Estado: ${r[statusKey]}</div>`;
-      previewList.appendChild(div);
-    }
+  function parseWorkbook(wb, filename) {
+    const first = wb.Sheets[wb.SheetNames[0]];
+    const json = XLSX.utils.sheet_to_json(first, { defval: '' });
+    rows = json.map(r => {
+      const clone = { ...r };
+      if (!clone.hasOwnProperty(statusKey)) clone[statusKey] = 'Pendiente';
+      return clone;
+    });
+    headers = rows.length ? Object.keys(rows[0]) : [];
+    currentFilename = filename;
+    renderColumns();
+    show(templateArea);
     show(previewArea);
-  });
+    currentPage = 1;
+    updateProgressUI();
+    renderPreviewList(currentPage);
+  }
 
-  // escape for display only
+  // --- Preview rendering (igual que antes) ---
+  function getFilteredRows() {
+    const q = (searchInput?.value || '').trim().toLowerCase();
+    if (!q) return rows;
+    return rows.filter(r => Object.values(r).some(v => String(v).toLowerCase().includes(q)));
+  }
+
+  function renderPreviewList(page = 1) {
+    if (!previewList) return;
+    previewList.innerHTML = '';
+    const tmpl = templateField.value || '';
+    const filtered = getFilteredRows();
+    const total = filtered.length;
+    const p = Math.max(1, Math.min(page, Math.ceil(total / perPage()) || 1));
+    currentPage = p;
+    const per = perPage();
+    const start = (currentPage - 1) * per;
+    const end = Math.min(start + per, total);
+
+    for (let idx = start; idx < end; idx++) {
+      const r = filtered[idx];
+      const text = interpolate(tmpl, r);
+      const phone = formatPhone(r[phoneColSelect.value]);
+
+      const item = document.createElement('div');
+      item.className = 'preview-item';
+
+      const left = document.createElement('div');
+      left.className = 'preview-left';
+      left.innerHTML = `<div class="preview-meta"><strong>#${idx + 1}</strong> | Tel: ${phone || '<em>sin teléfono</em>'}</div>
+                        <div class="preview-text">${escapeHtml(text)}</div>
+                        <div class="preview-meta">Estado: <strong>${r[statusKey]}</strong></div>`;
+
+      const actions = document.createElement('div');
+      actions.className = 'preview-actions';
+
+      const sendBtn = document.createElement('button');
+      sendBtn.className = 'small-btn btn-send';
+      sendBtn.textContent = 'Enviar WhatsApp';
+      sendBtn.addEventListener('click', () => {
+        if (!phone) { alert('No se encontró teléfono.'); return; }
+        const encoded = encodeURIComponent(text);
+        const url = modeSelect.value === 'web'
+          ? `https://web.whatsapp.com/send?phone=${phone}&text=${encoded}`
+          : `whatsapp://send?phone=${phone}&text=${encoded}`;
+        window.open(url, '_blank');
+      });
+
+      const cbWrap = document.createElement('label');
+      cbWrap.className = 'checkbox-row';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = r[statusKey] === 'Enviado';
+      cb.addEventListener('change', () => {
+        r[statusKey] = cb.checked ? 'Enviado' : 'Pendiente';
+        updateProgressUI();
+        autoSaveProgress(); // ✅ Guardado automático al marcar
+        const metaLines = left.querySelectorAll('.preview-meta');
+        if (metaLines[2]) metaLines[2].innerHTML = `Estado: <strong>${r[statusKey]}</strong>`;
+      });
+
+      const notSentBtn = document.createElement('button');
+      notSentBtn.className = 'small-btn';
+      notSentBtn.style.background = 'transparent';
+      notSentBtn.style.border = '1px solid rgba(0,0,0,0.04)';
+      notSentBtn.textContent = 'No enviado';
+      notSentBtn.addEventListener('click', () => {
+        r[statusKey] = 'No enviado';
+        cb.checked = false;
+        updateProgressUI();
+        autoSaveProgress(); // ✅ Guardado automático
+        const metaLines = left.querySelectorAll('.preview-meta');
+        if (metaLines[2]) metaLines[2].innerHTML = `Estado: <strong>${r[statusKey]}</strong>`;
+      });
+
+      const detailBtn = document.createElement('button');
+      detailBtn.className = 'small-btn';
+      detailBtn.textContent = 'Abrir detalle';
+      detailBtn.addEventListener('click', () => {
+        currentIndex = rows.indexOf(r);
+        openModalForIndex(currentIndex);
+      });
+
+      actions.appendChild(sendBtn);
+      cbWrap.appendChild(cb);
+      cbWrap.appendChild(document.createTextNode(' Enviado'));
+      actions.appendChild(cbWrap);
+      actions.appendChild(notSentBtn);
+      actions.appendChild(detailBtn);
+
+      item.appendChild(left);
+      item.appendChild(actions);
+      previewList.appendChild(item);
+    }
+
+    if (total > per) {
+      show(pager);
+      pagerInfo.textContent = `Mostrando ${start + 1}-${end} de ${total} (pág ${currentPage} / ${Math.ceil(total / per)})`;
+      prevPageBtn.disabled = currentPage <= 1;
+      nextPageBtn.disabled = currentPage >= Math.ceil(total / per);
+    } else {
+      hide(pager);
+    }
+  }
+
   function escapeHtml(s) {
     const div = document.createElement('div');
     div.textContent = s;
     return div.innerHTML;
   }
 
-  // --- One-by-one sequence ---
-  startBtn.addEventListener('click', () => {
+  // --- Resto de funciones (modal, open all, etc.) sin cambios ---
+  if (previewBtn) previewBtn.addEventListener('click', () => {
     if (!rows.length) { alert('Carga primero un archivo.'); return; }
-    // find first pending
+    renderPreviewList(1);
+  });
+  if (searchInput) searchInput.addEventListener('input', () => renderPreviewList(1));
+  if (perPageSelect) perPageSelect.addEventListener('change', () => renderPreviewList(1));
+  if (prevPageBtn) prevPageBtn.addEventListener('click', () => renderPreviewList(currentPage - 1));
+  if (nextPageBtn) nextPageBtn.addEventListener('click', () => renderPreviewList(currentPage + 1));
+
+  // Modal functions (same as before)
+  if (startBtn) startBtn.addEventListener('click', () => {
     const idx = rows.findIndex(r => r[statusKey] === 'Pendiente');
     if (idx === -1) { alert('No hay contactos pendientes.'); return; }
     currentIndex = idx;
@@ -205,9 +380,8 @@
   });
 
   function openModalForIndex(idx) {
-    if (idx < 0 || idx >= rows.length) { return; }
+    if (idx < 0 || idx >= rows.length) return;
     const r = rows[idx];
-    // skip non-pending by moving to next pending
     if (r[statusKey] !== 'Pendiente') {
       const next = rows.findIndex((x, i) => i > idx && x[statusKey] === 'Pendiente');
       if (next === -1) { alert('No hay más pendientes.'); return; }
@@ -216,93 +390,69 @@
     }
     modalTitle.textContent = `Contacto #${idx + 1}`;
     modalMeta.textContent = `Fila ${idx + 1} | Estado: ${r[statusKey]}`;
-    const msg = interpolate(templateField.value, r);
-    modalMessage.value = msg;
+    modalMessage.value = interpolate(templateField.value, r);
     const phone = formatPhone(r[phoneColSelect.value]);
     modalPhone.textContent = phone ? `Teléfono: ${phone}` : 'Teléfono: (no detectado)';
     show(modal);
     modal.setAttribute('aria-hidden', 'false');
   }
 
-  // modal controls
-  closeModalBtn.addEventListener('click', () => {
-    hide(modal);
-    modal.setAttribute('aria-hidden', 'true');
-  });
+  if (closeModalBtn) closeModalBtn.addEventListener('click', () => { hide(modal); modal.setAttribute('aria-hidden', 'true'); });
 
-  modalOpenBtn.addEventListener('click', () => {
+  if (modalOpenBtn) modalOpenBtn.addEventListener('click', () => {
     if (currentIndex === -1) return;
     const r = rows[currentIndex];
     const phone = formatPhone(r[phoneColSelect.value]);
-    if (!phone) { alert('No se detectó teléfono. Elige la columna correcta.'); return; }
+    if (!phone) { alert('No se detectó teléfono.'); return; }
     const text = modalMessage.value;
     const encoded = encodeURIComponent(text);
-    const mode = modeSelect.value;
-    let url = '';
-    if (mode === 'web') {
-      url = `https://web.whatsapp.com/send?phone=${phone}&text=${encoded}`;
-    } else {
-      // whatsapp uri
-      url = `whatsapp://send?phone=${phone}&text=${encoded}`;
-    }
-    // open in new tab/window
+    const url = modeSelect.value === 'web'
+      ? `https://web.whatsapp.com/send?phone=${phone}&text=${encoded}`
+      : `whatsapp://send?phone=${phone}&text=${encoded}`;
     window.open(url, '_blank');
   });
 
-  modalSentBtn.addEventListener('click', () => {
+  function updateStatusAndGoNext(status) {
     if (currentIndex === -1) return;
-    rows[currentIndex][statusKey] = 'Enviado';
+    rows[currentIndex][statusKey] = status;
     updateProgressUI();
+    autoSaveProgress();
     hide(modal);
     modal.setAttribute('aria-hidden', 'true');
+    renderPreviewList(currentPage);
     goToNextAfter(currentIndex);
-  });
+  }
 
-  modalNotSentBtn.addEventListener('click', () => {
-    if (currentIndex === -1) return;
-    rows[currentIndex][statusKey] = 'No enviado';
-    updateProgressUI();
+  if (modalSentBtn) modalSentBtn.addEventListener('click', () => updateStatusAndGoNext('Enviado'));
+  if (modalNotSentBtn) modalNotSentBtn.addEventListener('click', () => updateStatusAndGoNext('No enviado'));
+  if (modalNextBtn) modalNextBtn.addEventListener('click', () => {
     hide(modal);
-    modal.setAttribute('aria-hidden', 'true');
     goToNextAfter(currentIndex);
   });
-
-  modalNextBtn.addEventListener('click', () => {
-    // keep pending and move next
-    hide(modal);
-    modal.setAttribute('aria-hidden', 'true');
-    goToNextAfter(currentIndex);
-  });
-
-  modalCopyBtn.addEventListener('click', () => {
-    navigator.clipboard.writeText(modalMessage.value).then(() => {
-      alert('Mensaje copiado al portapapeles.');
-    }).catch(() => alert('No se pudo copiar al portapapeles.'));
+  if (modalCopyBtn) modalCopyBtn.addEventListener('click', () => {
+    navigator.clipboard.writeText(modalMessage.value).catch(() => alert('No se pudo copiar.'));
   });
 
   function goToNextAfter(idx) {
-    // find next pending after idx
     const next = rows.findIndex((r, i) => i > idx && r[statusKey] === 'Pendiente');
     if (next !== -1) {
       currentIndex = next;
-      setTimeout(() => openModalForIndex(currentIndex), 200); // pequeño delay para UX
+      setTimeout(() => openModalForIndex(currentIndex), 200);
     } else {
-      // any pending anywhere?
       const rem = rows.findIndex(r => r[statusKey] === 'Pendiente');
       if (rem !== -1) {
         currentIndex = rem;
         setTimeout(() => openModalForIndex(currentIndex), 200);
       } else {
-        alert('Proceso finalizado: no hay más pendientes.');
+        alert('Proceso finalizado.');
         currentIndex = -1;
       }
     }
   }
 
-  // --- Open all (warning about many tabs) ---
-  openAllBtn.addEventListener('click', () => {
+  if (openAllBtn) openAllBtn.addEventListener('click', () => {
     if (!rows.length) { alert('Carga primero un archivo.'); return; }
-    if (!confirm('Se abrirán pestañas para cada contacto con teléfono detectado. ¿Deseas continuar?')) return;
+    if (!confirm('¿Abrir todos los contactos con teléfono?')) return;
     const mode = modeSelect.value;
     const tmpl = templateField.value;
     let count = 0;
@@ -317,42 +467,104 @@
       window.open(url, '_blank');
       count++;
     });
-    if (count === 0) alert('No se detectaron teléfonos. Selecciona la columna correcta.');
+    if (count === 0) alert('No se detectaron teléfonos.');
   });
 
-  // --- Export CSV (with status) ---
-  exportBtn.addEventListener('click', () => {
-    if (!rows.length) { alert('Carga primero un archivo.'); return; }
-    // build CSV from rows (including statusKey)
-    const hdrs = Object.keys(rows[0]);
-    // ensure status column present
-    if (!hdrs.includes(statusKey)) hdrs.push(statusKey);
-    const lines = [];
-    lines.push(hdrs.map(h => `"${String(h).replace(/"/g, '""')}"`).join(','));
-    rows.forEach(r => {
-      const vals = hdrs.map(h => {
-        const v = r.hasOwnProperty(h) ? (r[h] === null || r[h] === undefined ? '' : String(r[h])) : '';
-        return `"${v.replace(/"/g, '""')}"`;
-      });
-      lines.push(vals.join(','));
+  // --- ✅ EXPORTAR Y MARCAR COMO FINALIZADO ---
+  if (exportExcelBtn) exportExcelBtn.addEventListener('click', async () => {
+    if (!rows.length) { alert('No hay datos.'); return; }
+
+    // Guardar estado final
+    await autoSaveProgress();
+
+    // Marcar como finalizado en Supabase
+    if (CURRENT_UMES_ID) {
+      await supabase
+        .from("umes")
+        .update({ finalizado: true }) // 🔑 ¡Aquí está la bandera!
+        .eq("id", CURRENT_UMES_ID);
+    }
+
+    // Exportar
+    const exportData = rows.map(r => {
+      const row = { ...r };
+      delete row[statusKey];
+      row.completado = r[statusKey] === 'Enviado' ? 'Sí' :
+                       r[statusKey] === 'No enviado' ? 'No' : 'Pendiente';
+      return row;
     });
-    const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    const filename = 'wmessage_export.csv';
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.json_to_sheet(exportData);
+    XLSX.utils.book_append_sheet(wb, ws, "Datos");
+    XLSX.writeFile(wb, `completado-${currentFilename || "datos"}.xlsx`);
+
+    alert("✅ Exportación completada y marcada como finalizada.");
+    // Reiniciar interfaz
+    rows = [];
+    headers = [];
+    CURRENT_UMES_ID = null;
+    currentFilename = null;
+    fileInput.value = "";
+    setFileInfo("Ningún archivo cargado");
+    hide(columnsArea);
+    hide(templateArea);
+    hide(previewArea);
+    hide(progressArea);
+    templateField.value = "Hola {{Nombre}}, soy José. ¿Te interesa {{Carrera}}?";
+    updateProgressUI();
   });
 
-  // init
-  (function init() {
-    // sample template
-    templateField.value = "Hola {{Nombre}}, soy José. Vi que te interesa {{Carrera}}. ¿Quieres más info?";
-    updateProgressUI();
-  })();
+  // --- Guardar progreso manual (crea nuevo registro) ---
+  if (saveProgressBtn) saveProgressBtn.addEventListener('click', async () => {
+    if (!rows.length || !templateField.value.trim()) {
+      alert("Carga un archivo y escribe una plantilla primero.");
+      return;
+    }
 
+    const { data, error } = await supabase
+      .from("umes")
+      .insert([
+        {
+          nombre_archivo: currentFilename,
+          filas: rows,
+          progreso: rows.map(r => ({ estado: r[statusKey] })),
+          plantilla: templateField.value,
+          finalizado: false // 🔑 Siempre false al guardar
+        }
+      ])
+      .select("id")
+      .single();
+
+    if (error) {
+      console.error("Error:", error);
+      alert("❌ Error al guardar: " + (error.message || "Ver consola"));
+    } else {
+      CURRENT_UMES_ID = data.id;
+      alert("✅ Guardado como sesión activa");
+      // Escuchar cambios
+      supabase
+        .channel(`realtime-umes-${CURRENT_UMES_ID}`)
+        .on("postgres_changes", { event: "UPDATE", schema: "public", table: "umes", filter: `id=eq.${CURRENT_UMES_ID}` }, (payload) => {
+          if (payload.new.finalizado) return;
+          const { filas, progreso, plantilla } = payload.new;
+          rows = filas.map((r, i) => ({ ...r, [statusKey]: progreso[i]?.estado || "Pendiente" }));
+          if (plantilla) templateField.value = plantilla;
+          updateProgressUI();
+          renderPreviewList(currentPage);
+        })
+        .subscribe();
+    }
+  });
+
+  if (resetAllBtn) resetAllBtn.addEventListener('click', () => {
+    if (confirm("¿Reiniciar todo?")) location.reload();
+  });
+
+  // --- ✅ INICIALIZAR: Cargar solo si hay sesión activa ---
+  (async function init() {
+    templateField.value = templateField.value || "Hola {{Nombre}}, soy José. ¿Te interesa {{Carrera}}?";
+    updateProgressUI();
+    await loadLatestActiveProgress(); // 🔑 Solo carga si finalizado = false
+  })();
 })();
