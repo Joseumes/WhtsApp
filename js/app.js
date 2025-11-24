@@ -52,7 +52,8 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
   let currentIndex = -1;
   let CURRENT_UMES_ID = null;
   let currentFilename = null;
-  let selectedPhoneColumn = null; // << NUEVA: columna de teléfono seleccionada
+  let selectedPhoneColumn = null;
+  let selectedMode = 'web'; // << NUEVO
 
   // === Paginación ===
   let currentPage = 1;
@@ -102,16 +103,16 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
     if (total > 0 && progressArea) show(progressArea); else if (progressArea) hide(progressArea);
   }
 
-  // === Guardado automático (incluye columna de teléfono) ===
+  // === Guardado automático (incluye ambos campos) ===
   async function autoSaveProgress() {
     if (!CURRENT_UMES_ID) return;
     try {
-      const phoneCol = phoneColSelect.value;
       await supabase
         .from("umes")
         .update({ 
           progreso: rows.map(r => ({ estado: r[statusKey] })),
-          columna_telefono: phoneCol
+          columna_telefono: phoneColSelect.value,
+          modo_whatsapp: modeSelect.value
         })
         .eq("id", CURRENT_UMES_ID);
     } catch (err) {
@@ -142,6 +143,7 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
       currentFilename = record.nombre_archivo;
       CURRENT_UMES_ID = record.id;
       selectedPhoneColumn = record.columna_telefono || null;
+      selectedMode = record.modo_whatsapp || 'web';
 
       if (record.progreso && Array.isArray(record.progreso)) {
         rows = rows.map((row, i) => ({
@@ -155,13 +157,15 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
       headers = rows.length ? Object.keys(rows[0]).filter(k => k !== statusKey) : [];
       renderColumns();
 
-      // Restaurar columna de teléfono
+      // Restaurar selecciones
       if (selectedPhoneColumn && headers.includes(selectedPhoneColumn)) {
         phoneColSelect.value = selectedPhoneColumn;
       } else if (headers.length) {
         const guess = headers.find(h => /phone|telefono|tel|cel|movil|whatsapp|numero|número/i.test(h));
         phoneColSelect.value = guess || headers[0];
       }
+
+      modeSelect.value = selectedMode; // << RESTAURAR MODO
 
       show(templateArea);
       show(previewArea);
@@ -170,7 +174,7 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
       updateProgressUI();
       renderPreviewList(1);
 
-      // Escuchar cambios en tiempo real
+      // Escuchar cambios
       supabase
         .channel(`realtime-umes-${CURRENT_UMES_ID}`)
         .on(
@@ -178,12 +182,14 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
           { event: "UPDATE", schema: "public", table: "umes", filter: `id=eq.${CURRENT_UMES_ID}` },
           (payload) => {
             if (payload.new.finalizado) return;
-            const { filas, progreso, plantilla } = payload.new;
+            const { filas, progreso, plantilla, columna_telefono, modo_whatsapp } = payload.new;
             rows = filas.map((r, i) => ({
               ...r,
               [statusKey]: progreso[i]?.estado || "Pendiente"
             }));
             if (plantilla) templateField.value = plantilla;
+            if (columna_telefono) phoneColSelect.value = columna_telefono;
+            if (modo_whatsapp) modeSelect.value = modo_whatsapp;
             updateProgressUI();
             renderPreviewList(currentPage);
           }
@@ -214,7 +220,6 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
       phoneColSelect.appendChild(opt);
     });
 
-    // No adivinar si ya tenemos una seleccionada
     if (selectedPhoneColumn && headers.includes(selectedPhoneColumn)) {
       phoneColSelect.value = selectedPhoneColumn;
     } else {
@@ -260,8 +265,10 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
     });
     headers = rows.length ? Object.keys(rows[0]) : [];
     currentFilename = filename;
-    selectedPhoneColumn = null; // Reset al cargar nuevo archivo
+    selectedPhoneColumn = null;
+    selectedMode = 'web';
     renderColumns();
+    modeSelect.value = 'web'; // Reset al cargar nuevo archivo
     show(templateArea);
     show(previewArea);
     currentPage = 1;
@@ -269,7 +276,7 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
     renderPreviewList(currentPage);
   }
 
-  // === Previsualización ===
+  // === Resto de funciones (sin cambios en lógica, pero con autoSaveProgress) ===
   function getFilteredRows() {
     const q = (searchInput?.value || '').trim().toLowerCase();
     if (!q) return rows;
@@ -325,7 +332,7 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
       cb.addEventListener('change', () => {
         r[statusKey] = cb.checked ? 'Enviado' : 'Pendiente';
         updateProgressUI();
-        autoSaveProgress();
+        autoSaveProgress(); // << GUARDA TODO
         const metaLines = left.querySelectorAll('.preview-meta');
         if (metaLines[2]) metaLines[2].innerHTML = `Estado: <strong>${r[statusKey]}</strong>`;
       });
@@ -339,7 +346,7 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
         r[statusKey] = 'No enviado';
         cb.checked = false;
         updateProgressUI();
-        autoSaveProgress();
+        autoSaveProgress(); // << GUARDA TODO
         const metaLines = left.querySelectorAll('.preview-meta');
         if (metaLines[2]) metaLines[2].innerHTML = `Estado: <strong>${r[statusKey]}</strong>`;
       });
@@ -380,7 +387,7 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
     return div.innerHTML;
   }
 
-  // === Eventos ===
+  // === Eventos de navegación ===
   if (previewBtn) previewBtn.addEventListener('click', () => {
     if (!rows.length) { alert('Carga primero un archivo.'); return; }
     renderPreviewList(1);
@@ -435,7 +442,7 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
     if (currentIndex === -1) return;
     rows[currentIndex][statusKey] = status;
     updateProgressUI();
-    autoSaveProgress();
+    autoSaveProgress(); // << GUARDA TODO
     hide(modal);
     modal.setAttribute('aria-hidden', 'true');
     renderPreviewList(currentPage);
@@ -522,6 +529,7 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
     CURRENT_UMES_ID = null;
     currentFilename = null;
     selectedPhoneColumn = null;
+    selectedMode = 'web';
     fileInput.value = "";
     setFileInfo("Ningún archivo cargado");
     hide(columnsArea);
@@ -529,6 +537,7 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
     hide(previewArea);
     hide(progressArea);
     templateField.value = "Hola {{Nombre}}, soy José. ¿Te interesa {{Carrera}}?";
+    modeSelect.value = 'web';
     updateProgressUI();
   });
 
@@ -539,8 +548,6 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
       return;
     }
 
-    const phoneCol = phoneColSelect.value;
-
     const { data, error } = await supabase
       .from("umes")
       .insert([
@@ -549,7 +556,8 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
           filas: rows,
           progreso: rows.map(r => ({ estado: r[statusKey] })),
           plantilla: templateField.value,
-          columna_telefono: phoneCol,
+          columna_telefono: phoneColSelect.value,
+          modo_whatsapp: modeSelect.value, // << GUARDADO
           finalizado: false
         }
       ])
@@ -561,15 +569,18 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
       alert("❌ Error al guardar: " + (error.message || "Ver consola"));
     } else {
       CURRENT_UMES_ID = data.id;
-      selectedPhoneColumn = phoneCol;
-      alert("✅ Guardado con columna: " + phoneCol);
+      selectedPhoneColumn = phoneColSelect.value;
+      selectedMode = modeSelect.value;
+      alert("✅ Guardado con columna: " + phoneColSelect.value + " y modo: " + modeSelect.value);
       supabase
         .channel(`realtime-umes-${CURRENT_UMES_ID}`)
         .on("postgres_changes", { event: "UPDATE", schema: "public", table: "umes", filter: `id=eq.${CURRENT_UMES_ID}` }, (payload) => {
           if (payload.new.finalizado) return;
-          const { filas, progreso, plantilla } = payload.new;
+          const { filas, progreso, plantilla, columna_telefono, modo_whatsapp } = payload.new;
           rows = filas.map((r, i) => ({ ...r, [statusKey]: progreso[i]?.estado || "Pendiente" }));
           if (plantilla) templateField.value = plantilla;
+          if (columna_telefono) phoneColSelect.value = columna_telefono;
+          if (modo_whatsapp) modeSelect.value = modo_whatsapp;
           updateProgressUI();
           renderPreviewList(currentPage);
         })
@@ -584,6 +595,7 @@ const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
   // === Inicializar ===
   (async function init() {
     templateField.value = templateField.value || "Hola {{Nombre}}, soy José. ¿Te interesa {{Carrera}}?";
+    modeSelect.value = 'web'; // valor por defecto
     updateProgressUI();
     await loadLatestActiveProgress();
   })();
